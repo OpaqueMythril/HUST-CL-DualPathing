@@ -18,21 +18,86 @@ from torch.autograd import Variable, Function
 
 
 class PromptGenerator(nn.Module):
-    def __init__(self, embed_dim=768, prompt_len=8):
+    def __init__(self, embed_dim=768, prompt_len=16, hidden_dim=256, tau=0.5):
         super(PromptGenerator, self).__init__()
-        self.prompt_len = prompt_len
         self.embed_dim = embed_dim
-        # 将 768 维特征映射为提示向量
-        self.net = nn.Sequential(
-            nn.Linear(embed_dim, 512),
-            nn.ReLU(),
-            nn.Linear(512, embed_dim * prompt_len)
+        self.prompt_len = prompt_len
+        self.tau = tau
+        self.gate = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1)
         )
 
-    def forward(self, x):
-        # x: [batch, 768] -> [batch, Lp, 768]
-        out = self.net(x)
-        return out.view(-1, self.prompt_len, self.embed_dim)
+        self.g_shared = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, prompt_len * embed_dim)
+        )
+
+        self.g_specifics = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, prompt_len * embed_dim)
+        )
+
+    def decompose_features(self, x, task_prototype):
+        v = task_prototype.expand(x.size(0), -1)
+        dot_product = torch.sum(x * v, dim=-1, keepdim=True)
+        v_norm_sq = torch.sum(v * v, dim=-1, keepdim=True) + 1e-8
+        projection_ratio = dot_product / v_norm_sq
+
+        v_proj = projection_ratio * v
+        v_diff = x - v_proj
+
+        return v_proj, v_diff
+
+    def forward(self, x, task_prototype=None):
+        """
+        x: 输入的 Image Features [Batch, 768]
+        task_prototype: 当前任务/历史任务的知识原型 [768]
+        """
+        B = x.shape[0]
+
+        # 1. 如果没有原型（例如第一个任务），则退化为普通生成
+        if task_prototype is None:
+            p_shared = self.g_shared(x)
+            return p_shared.view(B, self.prompt_len, self.embed_dim), torch.ones(B, 1).to(x.device)
+
+        # 2. 向量空间分解
+        v_shared, v_specific = self.decompose_features(x, task_prototype)
+
+        # 3. 计算强化门控权重 (Gating with Temperature)
+        # 逻辑：输入原始特征 x，通过温度系数 tau 缩放后进入 Sigmoid
+        # 较小的 tau 会让结果向 0 或 1 两极分化，增强选择的鲁棒性
+        gate_score = self.gate(x)
+        g = torch.sigmoid(gate_score / self.tau)
+
+        # 4. 双路提示生成
+        p_shared = self.g_shared(v_shared)  # 基于共享特征生成
+        p_specific = self.g_specifics(v_specific)  # 基于特性特征生成
+
+        # 5. 权重融合
+        # p = g * p_shared + (1 - g) * p_specific
+        p_combined = g.unsqueeze(-1) * p_shared + (1 - g).unsqueeze(-1) * p_specific
+
+        # 重塑形状为 [Batch, Prompt_Len, Embed_Dim]
+        p_out = p_combined.view(B, self.prompt_len, self.embed_dim)
+
+        return p_out, g
+
+    # 辅助函数：计算正交损失 (用于提升解耦效果)
+
+
+def get_orthogonality_loss(p_shared, p_specific):
+    """
+    计算共享提示和特性提示之间的余弦相似度，作为惩罚项
+    """
+    p_sh = F.normalize(p_shared.flatten(1), p=2, dim=-1)
+    p_sp = F.normalize(p_specific.flatten(1), p=2, dim=-1)
+    sim = torch.abs(torch.sum(p_sh * p_sp, dim=-1))
+    return sim.mean()
 
 
 class Prompt(NormalNN):
